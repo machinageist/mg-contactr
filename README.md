@@ -1,5 +1,49 @@
 # mg-contacts
 
-Slice 1 of the local-first contacts application is complete, together with the cryptographic and audit primitives of Slice 2. This crate defines the XDG configuration boundary, validates PostgreSQL as local-only, provides an explicit user-held key lifecycle, and supplies typed privacy domains with a fail-closed non-sensitive index policy. Versioned field envelopes now authenticate record, field, privacy, and purpose context; plaintext/key intermediates are zeroized. Append-only audit chains and encrypted soft-delete tombstones provide persistence-ready domain contracts without exposing private payloads. PostgreSQL persistence topology, person/organization CRUD, imports, astrology, esoteric records, digests, and interoperability remain open.
+mg-contacts is the local-first, encrypted contact store for the Geist suite. It owns contact
+identity, encrypted contact fields, revisions, audit history, and soft-delete state. It does not
+own calendar events, knowledge, source material, or external identity records.
 
-`MG_CONTACTS_DATABASE_URL` and the config file are accepted only when the URL uses localhost/loopback or Unix sockets. Credentials are never accepted through a CLI argument, avoiding process-list and shell-history leakage. On Linux, configuration, key, state, and cache paths use descriptor-relative no-follow traversal; directories are private (0700) and the encrypted key is private (0600). Other platforms fail closed for storage operations until an equivalent race-safe implementation exists. Authentication is process-local: a fresh process always reports an initialized key as `Locked`, and transient passphrase, KDF output, plaintext, and key buffers are zeroized. Every privacy domain—ordinary contact, relationship, birth/chart, and esoteric—defaults to sensitive and cannot enter a plaintext index without both an explicit non-sensitive classification and a separate explicit approval.
+## MVP workflow
+
+The CLI authenticates once per process. A new process starts locked; passphrases are never command
+arguments or environment variables.
+
+```text
+mg-contacts setup
+mg-contacts status
+mg-contacts create person-1     # stdin: name, email, phone
+mg-contacts read person-1
+mg-contacts list
+mg-contacts update person-1     # stdin: name, email, phone
+mg-contacts delete person-1     # append-only soft delete
+```
+
+Create and update read three lines from stdin after the passphrase prompt. Read and list decrypt
+only for the authenticated process. A deleted record is retained as encrypted history but omitted
+from `list`; attempting to read or mutate it reports a typed error.
+
+The current MVP store is an append-only encrypted JSON-lines file under the XDG data directory.
+Contact fields are individually ChaCha20-Poly1305 encrypted with authenticated record/field/privacy
+context. Revisions and audit events are persisted with each mutation. The store is private (`0600`)
+and its parent directory is private (`0700`). Restart persistence is verified by reopening the key
+in a separate process and reading the same store.
+
+## Privacy and authority boundaries
+
+- The user-held key is encrypted at rest with Argon2id and is process-local after authentication.
+- Plaintext contact fields are not written to the store, logs, debug output, or CLI arguments.
+- Audit entries contain action, actor, timestamp, and provenance—not private contact payloads.
+- Privacy classification defaults to sensitive and unindexable; there is no plaintext search index.
+- mg-contacts does not automatically remediate, synchronize, publish, or disclose contacts.
+- PostgreSQL configuration is validated as local-only and output is redacted; PostgreSQL topology,
+  imports, organization records, digests, and cross-application interoperability remain outside
+  this MVP slice.
+
+## Configuration
+
+`MG_CONTACTS_DATABASE_URL` and the config file are accepted only when the URL uses localhost,
+loopback, or a Unix socket. Credentials are never accepted through CLI arguments. On Linux,
+configuration, key, state, and cache paths use descriptor-relative no-follow traversal; insecure
+paths fail closed. Other platforms fail closed for secure storage until an equivalent race-safe
+implementation exists.
