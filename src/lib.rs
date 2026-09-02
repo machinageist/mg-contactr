@@ -1,9 +1,12 @@
 #![allow(clippy::missing_errors_doc)]
 
+pub mod audit;
 pub mod config;
+pub mod envelope;
 pub mod keyring;
 pub mod privacy;
 mod secure_fs;
+pub mod tombstone;
 
 use thiserror::Error;
 

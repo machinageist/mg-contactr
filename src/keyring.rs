@@ -204,6 +204,14 @@ impl KeyLifecycle {
     pub fn is_authenticated(&self) -> bool {
         self.key.is_some()
     }
+
+    /// Borrow the process-local field-encryption key inside this crate only.
+    ///
+    /// Keeping this accessor crate-private prevents callers from exporting key
+    /// material while allowing the envelope module to perform AEAD operations.
+    pub(crate) fn field_key(&self) -> Option<&[u8; KEY_BYTES]> {
+        self.key.as_deref()
+    }
 }
 
 fn validate_new_passphrase(passphrase: &str, confirmation: &str) -> Result<(), KeyError> {
