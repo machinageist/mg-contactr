@@ -169,6 +169,12 @@ impl AuditEvent {
     pub const fn timestamp(&self) -> TimestampMillis {
         self.timestamp
     }
+
+    // What the event records; every other field could already be read
+    #[must_use]
+    pub const fn action(&self) -> AuditAction {
+        self.action
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -76,9 +76,17 @@ pub fn create(
 ) -> Result<ContactView, ContactError> {
     let record_id = RecordId::parse(id).map_err(|_| ContactError::InvalidId)?;
     let records = load(path)?;
-    if records.iter().any(|r| r.id == record_id && !r.deleted) {
+    // Only the newest revision says whether this id is in use. Scanning every
+    // record found the pre-delete revisions, which still carry deleted = false,
+    // so a soft-deleted id could never be created again.
+    let previous = latest(&records, &record_id);
+    if previous.is_some_and(|r| !r.deleted) {
         return Err(ContactError::AlreadyExists);
     }
+    // Recreating an id continues its trail; the deletion stays on the record
+    let revision = previous.map_or(Ok(1), |r| {
+        r.revision.checked_add(1).ok_or(ContactError::Malformed)
+    })?;
     let record = build_record(
         key,
         &record_id,
@@ -86,9 +94,9 @@ pub fn create(
         email,
         phone,
         false,
-        1,
+        revision,
         AuditAction::Created,
-        1,
+        previous.map(|r| &r.audit),
     )?;
     append(path, &record)?;
     view(key, &record)
@@ -112,10 +120,6 @@ pub fn update(
         .revision
         .checked_add(1)
         .ok_or(ContactError::Malformed)?;
-    let sequence = u64::try_from(current.audit.entries().len())
-        .ok()
-        .and_then(|n| n.checked_add(1))
-        .ok_or(ContactError::Malformed)?;
     let record = build_record(
         key,
         &record_id,
@@ -125,7 +129,7 @@ pub fn update(
         false,
         revision,
         AuditAction::Updated,
-        sequence,
+        Some(&current.audit),
     )?;
     append(path, &record)?;
     view(key, &record)
@@ -145,10 +149,6 @@ pub fn soft_delete(key: &KeyLifecycle, path: &Path, id: &str) -> Result<ContactV
         .revision
         .checked_add(1)
         .ok_or(ContactError::Malformed)?;
-    let sequence = u64::try_from(current.audit.entries().len())
-        .ok()
-        .and_then(|n| n.checked_add(1))
-        .ok_or(ContactError::Malformed)?;
     let record = build_record(
         key,
         &record_id,
@@ -158,7 +158,7 @@ pub fn soft_delete(key: &KeyLifecycle, path: &Path, id: &str) -> Result<ContactV
         true,
         revision,
         AuditAction::SoftDeleted,
-        sequence,
+        Some(&current.audit),
     )?;
     append(path, &record)?;
     view(key, &record)
@@ -196,19 +196,27 @@ fn build_record(
     deleted: bool,
     revision: u64,
     action: AuditAction,
-    sequence: u64,
+    previous: Option<&AuditTrail>,
 ) -> Result<StoredContact, ContactError> {
     if name.is_empty() || email.is_empty() || phone.is_empty() {
         return Err(ContactError::InvalidField);
     }
-    let mut audit = AuditTrail::new(id.clone());
+    // The trail is this record's whole history, so it continues from the last
+    // revision. Starting a fresh one gave every event sequence 1, made every
+    // update and delete reuse the id "<record>:2", and left previous_event_id
+    // empty so nothing linked to what came before it.
+    let mut audit = previous.map_or_else(|| AuditTrail::new(id.clone()), Clone::clone);
+    let sequence = u64::try_from(audit.entries().len())
+        .ok()
+        .and_then(|length| length.checked_add(1))
+        .ok_or(ContactError::Malformed)?;
     let event_id = AuditEventId::parse(format!("{}:{sequence}", id.as_str()))
         .map_err(|_| ContactError::InvalidField)?;
     let actor = ActorId::parse("local-user").map_err(|_| ContactError::InvalidField)?;
     let provenance = Provenance::new("mg-contacts", format!("contact:{}", id.as_str()))?;
     audit.append(NewAuditEvent::new(
         event_id,
-        now(),
+        next_timestamp(&audit),
         actor,
         action,
         provenance,
@@ -300,6 +308,17 @@ fn append(path: &Path, record: &StoredContact) -> Result<(), ContactError> {
         .and_then(|()| file.sync_all())
         .map_err(ContactError::Write)
 }
+// A trail refuses an event whose timestamp does not advance, and the clock only
+// counts whole milliseconds — two edits inside one of them are entirely ordinary.
+// Step past the last event rather than refusing an edit the user legitimately made.
+fn next_timestamp(audit: &AuditTrail) -> TimestampMillis {
+    let reading = now();
+    audit.entries().last().map_or(reading, |last| {
+        let floor = last.timestamp().get().saturating_add(1);
+        TimestampMillis::new(reading.get().max(floor))
+    })
+}
+
 fn now() -> TimestampMillis {
     TimestampMillis::new(
         i64::try_from(
@@ -318,6 +337,7 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditEvent;
     use std::fs;
     use tempfile::tempdir;
     const PASSPHRASE: &str = "correct horse battery staple";
@@ -370,6 +390,136 @@ mod tests {
         ));
         assert!(list(&reopened, &store_path).unwrap().is_empty());
     }
+    // Set up a keyring and an empty store, the way every test here needs one
+    fn scratch(dir: &tempfile::TempDir) -> (KeyLifecycle, std::path::PathBuf) {
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let mut key = KeyLifecycle::new(data.join("keyring.json"));
+        key.setup(PASSPHRASE, PASSPHRASE).unwrap();
+        (key, data.join("contacts.log"))
+    }
+
+    #[test]
+    fn a_soft_deleted_id_can_be_used_again() {
+        // The store is append-only, so the pre-delete revisions still say
+        // deleted = false. Reading those instead of the newest one bricked the id.
+        let dir = tempdir().unwrap();
+        let (key, store) = scratch(&dir);
+        create(&key, &store, "person-1", "Ada", "ada@example.test", "phone").unwrap();
+        update(
+            &key,
+            &store,
+            "person-1",
+            "Ada B",
+            "ada@example.test",
+            "phone",
+        )
+        .unwrap();
+        soft_delete(&key, &store, "person-1").unwrap();
+
+        let reborn = create(
+            &key,
+            &store,
+            "person-1",
+            "Grace",
+            "grace@example.test",
+            "phone",
+        )
+        .expect("a deleted id is free to use again");
+        assert_eq!(reborn.name, "Grace");
+        assert!(!reborn.deleted);
+        assert_eq!(get(&key, &store, "person-1").unwrap().name, "Grace");
+        assert_eq!(list(&key, &store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_live_id_is_still_refused() {
+        let dir = tempdir().unwrap();
+        let (key, store) = scratch(&dir);
+        create(&key, &store, "person-1", "Ada", "ada@example.test", "phone").unwrap();
+        assert!(matches!(
+            create(&key, &store, "person-1", "Grace", "g@example.test", "phone"),
+            Err(ContactError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn the_audit_trail_accumulates_across_revisions() {
+        let dir = tempdir().unwrap();
+        let (key, store) = scratch(&dir);
+        create(&key, &store, "person-1", "Ada", "ada@example.test", "phone").unwrap();
+        update(
+            &key,
+            &store,
+            "person-1",
+            "Ada B",
+            "ada@example.test",
+            "phone",
+        )
+        .unwrap();
+        soft_delete(&key, &store, "person-1").unwrap();
+
+        let records = load(&store).unwrap();
+        let id = RecordId::parse("person-1").unwrap();
+        let entries = latest(&records, &id).unwrap().audit.entries();
+
+        assert_eq!(entries.len(), 3, "every revision keeps the ones before it");
+        assert_eq!(
+            entries.iter().map(AuditEvent::sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // Each event used to be "<id>:2"; they have to be distinct to identify anything
+        let ids: Vec<_> = entries.iter().map(|e| e.event_id().as_str()).collect();
+        assert_eq!(ids, vec!["person-1:1", "person-1:2", "person-1:3"]);
+        assert_eq!(
+            entries.iter().map(AuditEvent::action).collect::<Vec<_>>(),
+            vec![
+                AuditAction::Created,
+                AuditAction::Updated,
+                AuditAction::SoftDeleted
+            ]
+        );
+        // The chain has to link, or the trail cannot be walked backwards
+        assert!(entries[0].previous_event_id().is_none());
+        for pair in entries.windows(2) {
+            assert_eq!(
+                pair[1].previous_event_id().map(AuditEventId::as_str),
+                Some(pair[0].event_id().as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn edits_inside_one_millisecond_still_advance_the_trail() {
+        // The clock counts whole milliseconds and a trail refuses an event that
+        // does not advance, so back-to-back edits must not be refused.
+        let dir = tempdir().unwrap();
+        let (key, store) = scratch(&dir);
+        create(&key, &store, "person-1", "Ada", "ada@example.test", "phone").unwrap();
+        for round in 0..12 {
+            update(
+                &key,
+                &store,
+                "person-1",
+                &format!("Ada {round}"),
+                "ada@example.test",
+                "phone",
+            )
+            .expect("a fast edit is still a legitimate edit");
+        }
+        let records = load(&store).unwrap();
+        let id = RecordId::parse("person-1").unwrap();
+        let entries = latest(&records, &id).unwrap().audit.entries();
+        assert_eq!(entries.len(), 13);
+        for pair in entries.windows(2) {
+            assert!(
+                pair[1].timestamp() > pair[0].timestamp(),
+                "timestamps must be strictly increasing"
+            );
+        }
+    }
+
     #[test]
     fn wrong_passphrase_cannot_read_contact() {
         let dir = tempdir().unwrap();
