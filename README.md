@@ -47,3 +47,7 @@ loopback, or a Unix socket. Credentials are never accepted through CLI arguments
 configuration, key, state, and cache paths use descriptor-relative no-follow traversal; insecure
 paths fail closed. Other platforms fail closed for secure storage until an equivalent race-safe
 implementation exists.
+
+## License
+
+MIT. See `LICENSE`.
