@@ -1,8 +1,7 @@
 //! Encrypted, restart-persistent contact records.
 
-use std::{collections::BTreeMap, fs::OpenOptions, io::Write, path::Path};
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -14,10 +13,10 @@ use crate::{
     envelope::{EncryptedFieldEnvelope, EnvelopeError, FieldContext, FieldId, FieldPurpose},
     keyring::KeyLifecycle,
     privacy::{PrivacyClassification, PrivacyDomain},
+    store::{Store, StoreError, StoredContact},
 };
 
 const STORE_VERSION: u8 = 1;
-const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ContactError {
@@ -27,6 +26,8 @@ pub enum ContactError {
     Write(#[source] std::io::Error),
     #[error("contact store is malformed")]
     Malformed,
+    #[error("contact store was written by a newer mg-contacts")]
+    FutureStore,
     #[error("contact already exists")]
     AlreadyExists,
     #[error("contact was not found")]
@@ -43,17 +44,22 @@ pub enum ContactError {
     Audit(#[from] crate::audit::AuditError),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredContact {
-    version: u8,
-    id: RecordId,
-    name: EncryptedFieldEnvelope,
-    email: EncryptedFieldEnvelope,
-    phone: EncryptedFieldEnvelope,
-    deleted: bool,
-    revision: u64,
-    audit: AuditTrail,
+// A store failure met while reading; the reason stays inside the error, never in output
+fn read_failure(error: StoreError) -> ContactError {
+    match error {
+        StoreError::Malformed => ContactError::Malformed,
+        StoreError::FutureSchema => ContactError::FutureStore,
+        other => ContactError::Read(other.into_io()),
+    }
+}
+
+// The same failure met while writing, so the two stay distinguishable to the caller
+fn write_failure(error: StoreError) -> ContactError {
+    match error {
+        StoreError::Malformed => ContactError::Malformed,
+        StoreError::FutureSchema => ContactError::FutureStore,
+        other => ContactError::Write(other.into_io()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +72,7 @@ pub struct ContactView {
     pub deleted: bool,
 }
 
+// Add a contact, or bring a soft-deleted id back
 pub fn create(
     key: &KeyLifecycle,
     path: &Path,
@@ -75,11 +82,12 @@ pub fn create(
     phone: &str,
 ) -> Result<ContactView, ContactError> {
     let record_id = RecordId::parse(id).map_err(|_| ContactError::InvalidId)?;
-    let records = load(path)?;
+    let store = Store::open(path).map_err(write_failure)?;
     // Only the newest revision says whether this id is in use. Scanning every
     // record found the pre-delete revisions, which still carry deleted = false,
     // so a soft-deleted id could never be created again.
-    let previous = latest(&records, &record_id);
+    let previous = store.latest(&record_id).map_err(read_failure)?;
+    let previous = previous.as_ref();
     if previous.is_some_and(|r| !r.deleted) {
         return Err(ContactError::AlreadyExists);
     }
@@ -98,10 +106,11 @@ pub fn create(
         AuditAction::Created,
         previous.map(|r| &r.audit),
     )?;
-    append(path, &record)?;
+    store.append(&record).map_err(write_failure)?;
     view(key, &record)
 }
 
+// Replace a contact's fields with a new revision
 pub fn update(
     key: &KeyLifecycle,
     path: &Path,
@@ -111,8 +120,11 @@ pub fn update(
     phone: &str,
 ) -> Result<ContactView, ContactError> {
     let record_id = RecordId::parse(id).map_err(|_| ContactError::InvalidId)?;
-    let records = load(path)?;
-    let current = latest(&records, &record_id).ok_or(ContactError::NotFound)?;
+    let store = Store::open(path).map_err(write_failure)?;
+    let current = store
+        .latest(&record_id)
+        .map_err(read_failure)?
+        .ok_or(ContactError::NotFound)?;
     if current.deleted {
         return Err(ContactError::Deleted);
     }
@@ -131,14 +143,18 @@ pub fn update(
         AuditAction::Updated,
         Some(&current.audit),
     )?;
-    append(path, &record)?;
+    store.append(&record).map_err(write_failure)?;
     view(key, &record)
 }
 
+// Retire a contact, keeping every revision it already had
 pub fn soft_delete(key: &KeyLifecycle, path: &Path, id: &str) -> Result<ContactView, ContactError> {
     let record_id = RecordId::parse(id).map_err(|_| ContactError::InvalidId)?;
-    let records = load(path)?;
-    let current = latest(&records, &record_id).ok_or(ContactError::NotFound)?;
+    let store = Store::open(path).map_err(write_failure)?;
+    let current = store
+        .latest(&record_id)
+        .map_err(read_failure)?
+        .ok_or(ContactError::NotFound)?;
     if current.deleted {
         return Err(ContactError::Deleted);
     }
@@ -160,27 +176,31 @@ pub fn soft_delete(key: &KeyLifecycle, path: &Path, id: &str) -> Result<ContactV
         AuditAction::SoftDeleted,
         Some(&current.audit),
     )?;
-    append(path, &record)?;
+    store.append(&record).map_err(write_failure)?;
     view(key, &record)
 }
 
+// Read one live contact
 pub fn get(key: &KeyLifecycle, path: &Path, id: &str) -> Result<ContactView, ContactError> {
     let record_id = RecordId::parse(id).map_err(|_| ContactError::InvalidId)?;
-    let records = load(path)?;
-    let record = latest(&records, &record_id).ok_or(ContactError::NotFound)?;
+    let store = Store::open(path).map_err(read_failure)?;
+    let record = store
+        .latest(&record_id)
+        .map_err(read_failure)?
+        .ok_or(ContactError::NotFound)?;
     if record.deleted {
         return Err(ContactError::Deleted);
     }
-    view(key, record)
+    view(key, &record)
 }
 
+// Read every live contact, in id order
 pub fn list(key: &KeyLifecycle, path: &Path) -> Result<Vec<ContactView>, ContactError> {
-    let mut latest_records = BTreeMap::new();
-    for record in load(path)? {
-        latest_records.insert(record.id.as_str().to_owned(), record);
-    }
-    latest_records
-        .values()
+    Store::open(path)
+        .map_err(read_failure)?
+        .latest_all()
+        .map_err(read_failure)?
+        .iter()
         .filter(|r| !r.deleted)
         .map(|r| view(key, r))
         .collect()
@@ -270,44 +290,6 @@ fn view(key: &KeyLifecycle, record: &StoredContact) -> Result<ContactView, Conta
         deleted: record.deleted,
     })
 }
-fn latest<'a>(records: &'a [StoredContact], id: &RecordId) -> Option<&'a StoredContact> {
-    records.iter().rev().find(|r| &r.id == id)
-}
-fn load(path: &Path) -> Result<Vec<StoredContact>, ContactError> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let bytes = std::fs::read(path).map_err(ContactError::Read)?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(ContactError::Malformed);
-    }
-    bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).map_err(|_| ContactError::Malformed))
-        .collect()
-}
-fn append(path: &Path, record: &StoredContact) -> Result<(), ContactError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(ContactError::Write)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .map_err(ContactError::Write)?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(ContactError::Write)?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(ContactError::Write)?;
-    let bytes = serde_json::to_vec(record).map_err(|_| ContactError::Malformed)?;
-    file.write_all(&bytes)
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all())
-        .map_err(ContactError::Write)
-}
 // A trail refuses an event whose timestamp does not advance, and the clock only
 // counts whole milliseconds — two edits inside one of them are entirely ordinary.
 // Step past the last event rather than refusing an edit the user legitimately made.
@@ -331,9 +313,6 @@ fn now() -> TimestampMillis {
     )
 }
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +327,7 @@ mod tests {
         fs::create_dir(&data).unwrap();
         fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let key_path = data.join("keyring.json");
-        let store_path = data.join("contacts.log");
+        let store_path = data.join("contacts.sqlite");
         let mut key = KeyLifecycle::new(&key_path);
         key.setup(PASSPHRASE, PASSPHRASE).unwrap();
         create(
@@ -397,7 +376,7 @@ mod tests {
         fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let mut key = KeyLifecycle::new(data.join("keyring.json"));
         key.setup(PASSPHRASE, PASSPHRASE).unwrap();
-        (key, data.join("contacts.log"))
+        (key, data.join("contacts.sqlite"))
     }
 
     #[test]
@@ -460,9 +439,9 @@ mod tests {
         .unwrap();
         soft_delete(&key, &store, "person-1").unwrap();
 
-        let records = load(&store).unwrap();
         let id = RecordId::parse("person-1").unwrap();
-        let entries = latest(&records, &id).unwrap().audit.entries();
+        let newest = Store::open(&store).unwrap().latest(&id).unwrap().unwrap();
+        let entries = newest.audit.entries();
 
         assert_eq!(entries.len(), 3, "every revision keeps the ones before it");
         assert_eq!(
@@ -508,9 +487,9 @@ mod tests {
             )
             .expect("a fast edit is still a legitimate edit");
         }
-        let records = load(&store).unwrap();
         let id = RecordId::parse("person-1").unwrap();
-        let entries = latest(&records, &id).unwrap().audit.entries();
+        let newest = Store::open(&store).unwrap().latest(&id).unwrap().unwrap();
+        let entries = newest.audit.entries();
         assert_eq!(entries.len(), 13);
         for pair in entries.windows(2) {
             assert!(
@@ -527,7 +506,7 @@ mod tests {
         fs::create_dir(&data).unwrap();
         fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         let key_path = data.join("keyring.json");
-        let store_path = data.join("contacts.log");
+        let store_path = data.join("contacts.sqlite");
         let mut key = KeyLifecycle::new(&key_path);
         key.setup(PASSPHRASE, PASSPHRASE).unwrap();
         create(

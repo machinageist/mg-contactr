@@ -23,11 +23,17 @@ Create and update read three lines from stdin after the passphrase prompt. Read 
 only for the authenticated process. A deleted record is retained as encrypted history but omitted
 from `list`; attempting to read or mutate it reports a typed error.
 
-The current MVP store is an append-only encrypted JSON-lines file under the XDG data directory.
-Contact fields are individually ChaCha20-Poly1305 encrypted with authenticated record/field/privacy
-context. Revisions and audit events are persisted with each mutation. The store is private (`0600`)
-and its parent directory is private (`0700`). Restart persistence is verified by reopening the key
-in a separate process and reading the same store.
+The store is one SQLite file under the XDG data directory, holding one append-only row per
+revision. Only ciphertext and the metadata the old JSON-lines log already left in the clear are
+stored: record id, revision, deleted flag, audit trail. Contact fields are individually
+ChaCha20-Poly1305 encrypted with authenticated record/field/privacy context, and arrive sealed,
+so a plaintext field never reaches the database, its write-ahead log, or a temporary table.
+Revisions and audit events are persisted with each mutation. The file is private (`0600`), its
+sidecars inherit that mode, and its parent directory is private (`0700`). Restart persistence is
+verified by reopening the key in a separate process and reading the same store.
+
+A revision is written in one transaction, so an interrupted write leaves no half-record behind —
+the failure mode the append-only text log had, where one torn line could make the file unreadable.
 
 ## Privacy and authority boundaries
 

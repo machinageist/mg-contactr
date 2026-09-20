@@ -65,7 +65,7 @@ fn run() -> Result<(), AppError> {
         command => {
             let passphrase = read_passphrase("Passphrase: ")?;
             keys.verify_passphrase(&passphrase)?;
-            let path = settings.paths.data_dir.join("contacts.log");
+            let path = settings.paths.data_dir.join("contacts.sqlite");
             match command {
                 Command::Create { id } => {
                     let item = contact::create(

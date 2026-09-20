@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod keyring;
 pub mod privacy;
 mod secure_fs;
+pub mod store;
 pub mod tombstone;
 
 use thiserror::Error;
